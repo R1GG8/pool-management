@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pool_postgres
+    environment:
+      POSTGRES_DB: pool_db
+      POSTGRES_USER: pool_user
+      POSTGRES_PASSWORD: pool_password
+    ports:
+      - "5439:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
