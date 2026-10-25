@@ -2,15 +2,17 @@ package ru.pool.poolmanagement.service;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import ru.pool.poolmanagement.dto.reservation.AvailableSlotResponse;
 import ru.pool.poolmanagement.dto.client.ClientDetailsResponse;
+import ru.pool.poolmanagement.dto.reservation.AvailableSlotResponse;
 import ru.pool.poolmanagement.dto.reservation.OccupiedSlotResponse;
 import ru.pool.poolmanagement.exception.BadRequestException;
 import ru.pool.poolmanagement.exception.NotFoundException;
 import ru.pool.poolmanagement.exception.SlotFullException;
 import ru.pool.poolmanagement.model.Client;
+import ru.pool.poolmanagement.model.HolidaySchedule;
 import ru.pool.poolmanagement.model.Reservation;
 import ru.pool.poolmanagement.repository.ClientRepository;
+import ru.pool.poolmanagement.repository.HolidayRepository;
 import ru.pool.poolmanagement.repository.ReservationRepository;
 
 import java.time.LocalDate;
@@ -21,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @Service
@@ -28,33 +31,45 @@ public class ReservationService {
 
     private final ReservationRepository reservationRepository;
     private final ClientRepository clientRepository;
+    private final HolidayRepository holidayRepository;
 
     private final int capacityPerHour;
-    private final LocalTime openTime;
-    private final LocalTime closeTime;
+    private final LocalTime defaultOpenTime;
+    private final LocalTime defaultCloseTime;
 
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
+
+    // Вспомогательный рекорд для графика на день
+    private record DaySchedule(boolean isClosed, LocalTime openTime, LocalTime closeTime) {
+    }
 
     public ReservationService(
             ReservationRepository reservationRepository,
             ClientRepository clientRepository,
+            HolidayRepository holidayRepository,
             @Value("${pool.capacity-per-hour:10}") int capacityPerHour,
             @Value("${pool.working-hours.open:08:00}") String openTime,
             @Value("${pool.working-hours.close:22:00}") String closeTime) {
         this.reservationRepository = reservationRepository;
         this.clientRepository = clientRepository;
+        this.holidayRepository = holidayRepository;
         this.capacityPerHour = capacityPerHour;
-        this.openTime = LocalTime.parse(openTime);
-        this.closeTime = LocalTime.parse(closeTime);
+        this.defaultOpenTime = LocalTime.parse(openTime);
+        this.defaultCloseTime = LocalTime.parse(closeTime);
     }
 
+    // 1. Получение доступных слотов на дату (с учетом праздников)
     public List<AvailableSlotResponse> getAvailableSlots(LocalDate date) {
+        DaySchedule schedule = getScheduleForDate(date);
+        if (schedule.isClosed()) {
+            return Collections.emptyList(); // Если выходной/праздник — доступных слотов нет
+        }
+
         Map<Integer, Integer> hourlyCounts = reservationRepository.countActiveReservationsByHourForDate(date);
         List<AvailableSlotResponse> result = new ArrayList<>();
 
-        int startHour = openTime.getHour();
-        // Если бассейн работает до 22:00, последний одночасовой слот начинается в 21:00
-        int lastHour = closeTime.getHour() - 1;
+        int startHour = schedule.openTime().getHour();
+        int lastHour = schedule.closeTime().getHour() - 1;
 
         for (int hour = startHour; hour <= lastHour; hour++) {
             int booked = hourlyCounts.getOrDefault(hour, 0);
@@ -67,6 +82,7 @@ public class ReservationService {
         return result;
     }
 
+    // 2. Получение занятых слотов
     public List<OccupiedSlotResponse> getOccupiedSlots(LocalDate date) {
         Map<LocalDateTime, List<Client>> occupiedMap = reservationRepository.findOccupiedSlotsWithClients(date);
         List<OccupiedSlotResponse> result = new ArrayList<>();
@@ -89,6 +105,7 @@ public class ReservationService {
         return result;
     }
 
+    // 3. Бронирование слота
     public UUID bookReservation(Long clientId, LocalDateTime datetime, Integer requestedDuration) {
         int duration = (requestedDuration != null) ? requestedDuration : 1;
 
@@ -109,6 +126,36 @@ public class ReservationService {
         }
     }
 
+    // 4. Отмена записи
+    public void cancelReservation(UUID reservationId, Long clientId, String reason) {
+        Reservation reservation = reservationRepository.findById(reservationId)
+                .orElseThrow(() -> new NotFoundException("Запись с id " + reservationId + " не найдена"));
+
+        if (!reservation.getClientId().equals(clientId)) {
+            throw new BadRequestException("Указанный clientId не совпадает с владельцем записи");
+        }
+
+        if ("CANCELLED".equals(reservation.getStatus().name())) {
+            throw new BadRequestException("Эта запись уже была отменена ранее");
+        }
+
+        reservationRepository.cancelReservation(reservationId, reason);
+    }
+
+    // Определение графика на день (праздник или обычный)
+    private DaySchedule getScheduleForDate(LocalDate date) {
+        Optional<HolidaySchedule> holidayOpt = holidayRepository.findByDate(date);
+        if (holidayOpt.isPresent()) {
+            HolidaySchedule h = holidayOpt.get();
+            if (h.isClosed()) {
+                return new DaySchedule(true, null, null);
+            }
+            return new DaySchedule(false, h.getOpenTime(), h.getCloseTime());
+        }
+        return new DaySchedule(false, defaultOpenTime, defaultCloseTime);
+    }
+
+    // Валидация правил времени
     private void validateReservationTime(LocalDateTime startDatetime, int durationHours) {
         if (startDatetime.getMinute() != 0 || startDatetime.getSecond() != 0 || startDatetime.getNano() != 0) {
             throw new BadRequestException("Время записи должно быть кратно ровно 1 часу (например, 10:00, 11:00)");
@@ -118,34 +165,25 @@ public class ReservationService {
             throw new BadRequestException("Нельзя записаться на прошедшее время");
         }
 
+        LocalDate date = startDatetime.toLocalDate();
+        DaySchedule schedule = getScheduleForDate(date);
+
+        if (schedule.isClosed()) {
+            throw new BadRequestException("Бассейн не работает в этот день (праздничный день)");
+        }
+
         LocalTime startTime = startDatetime.toLocalTime();
         LocalTime endTime = startTime.plusHours(durationHours);
 
-        // Проверяем, не начинается ли запись до открытия
-        if (startTime.isBefore(openTime)) {
-            throw new BadRequestException("Бассейн открывается в " + openTime);
+        if (startTime.isBefore(schedule.openTime())) {
+            throw new BadRequestException("Бассейн открывается в " + schedule.openTime());
         }
 
-        if (endTime.isAfter(closeTime) || (endTime.isBefore(startTime) && !closeTime.equals(LocalTime.MIDNIGHT))) {
+        if (endTime.isAfter(schedule.closeTime()) || (endTime.isBefore(startTime) && !schedule.closeTime().equals(LocalTime.MIDNIGHT))) {
             throw new BadRequestException(String.format(
                     "Сеанс длительностью %d ч. выходит за рамки рабочего времени бассейна (закрытие в %s)",
-                    durationHours, closeTime
+                    durationHours, schedule.closeTime()
             ));
         }
-    }
-
-    public void cancelReservation(UUID reservationId, Long clientId, String reason) {
-        Reservation reservation = reservationRepository.findById(reservationId)
-                .orElseThrow(() -> new NotFoundException("Запись с id " + reservationId + " не найдена"));
-
-        if (!reservation.getClientId().equals(clientId)) {
-            throw new BadRequestException("Указанный clientId не совпадает с владельцем записи");
-        }
-
-        if ("CANCELLED".equals(reservation.getStatus())) {
-            throw new BadRequestException("Эта запись уже была отменена ранее");
-        }
-
-        reservationRepository.cancelReservation(reservationId, reason);
     }
 }

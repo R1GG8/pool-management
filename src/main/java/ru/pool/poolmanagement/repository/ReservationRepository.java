@@ -150,7 +150,14 @@ public class ReservationRepository {
     }
 
     public void cancelReservation(UUID id, String reason) {
-        String sql = "UPDATE reservations SET status = 'CANCELLED', cancel_reason = ? WHERE id = ?";
+        // Находим бронь и отменяем её саму и все смежные часы, созданные в этой же транзакции
+        String sql = """
+                    UPDATE reservations 
+                    SET status = 'CANCELLED', cancel_reason = ? 
+                    WHERE (client_id, created_at) = (
+                        SELECT client_id, created_at FROM reservations WHERE id = ?
+                    ) AND status = 'ACTIVE'
+                """;
 
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {

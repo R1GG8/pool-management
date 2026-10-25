@@ -9,7 +9,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import ru.pool.poolmanagement.exception.BadRequestException;
 import ru.pool.poolmanagement.exception.SlotFullException;
 import ru.pool.poolmanagement.model.Client;
+import ru.pool.poolmanagement.model.HolidaySchedule;
 import ru.pool.poolmanagement.repository.ClientRepository;
+import ru.pool.poolmanagement.repository.HolidayRepository;
 import ru.pool.poolmanagement.repository.ReservationRepository;
 
 import java.time.LocalDate;
@@ -30,6 +32,9 @@ class ReservationServiceTest {
     @Mock
     private ClientRepository clientRepository;
 
+    @Mock
+    private HolidayRepository holidayRepository;
+
     private ReservationService reservationService;
 
     @BeforeEach
@@ -37,6 +42,7 @@ class ReservationServiceTest {
         reservationService = new ReservationService(
                 reservationRepository,
                 clientRepository,
+                holidayRepository,
                 10,
                 "08:00",
                 "22:00"
@@ -49,6 +55,7 @@ class ReservationServiceTest {
         Long clientId = 1L;
         LocalDateTime futureTime = LocalDate.now().plusDays(1).atTime(12, 0, 0);
 
+        when(holidayRepository.findByDate(futureTime.toLocalDate())).thenReturn(Optional.empty());
         when(clientRepository.findById(clientId))
                 .thenReturn(Optional.of(new Client(clientId, "Иван", "+79991112233", "ivan@mail.ru")));
         when(reservationRepository.hasActiveReservationOnDate(eq(clientId), any(LocalDate.class)))
@@ -63,11 +70,31 @@ class ReservationServiceTest {
     }
 
     @Test
+    @DisplayName("Ошибка, если бронирование происходит в закрытый праздничный день")
+    void bookReservation_OnClosedHoliday_ThrowsBadRequest() {
+        Long clientId = 1L;
+        LocalDate holidayDate = LocalDate.now().plusDays(5);
+        LocalDateTime time = holidayDate.atTime(12, 0, 0);
+
+        // Имитируем праздник со статусом закрыто
+        when(holidayRepository.findByDate(holidayDate))
+                .thenReturn(Optional.of(new HolidaySchedule(holidayDate, true, null, null)));
+
+        BadRequestException ex = assertThrows(BadRequestException.class, () ->
+                reservationService.bookReservation(clientId, time, 1)
+        );
+
+        assertTrue(ex.getMessage().contains("не работает в этот день (праздничный день)"));
+        verifyNoInteractions(reservationRepository);
+    }
+
+    @Test
     @DisplayName("Успешное бронирование на 2 часа подряд")
     void bookReservation_ConsecutiveHours_Success() {
         Long clientId = 1L;
         LocalDateTime futureTime = LocalDate.now().plusDays(1).atTime(10, 0, 0);
 
+        when(holidayRepository.findByDate(futureTime.toLocalDate())).thenReturn(Optional.empty());
         when(clientRepository.findById(clientId))
                 .thenReturn(Optional.of(new Client(clientId, "Иван", "+79991112233", "ivan@mail.ru")));
         when(reservationRepository.hasActiveReservationOnDate(eq(clientId), any(LocalDate.class)))
@@ -86,6 +113,8 @@ class ReservationServiceTest {
     void bookReservation_ExceedsClosingTime_ThrowsBadRequest() {
         Long clientId = 1L;
         LocalDateTime lateTime = LocalDate.now().plusDays(1).atTime(21, 0, 0);
+
+        when(holidayRepository.findByDate(lateTime.toLocalDate())).thenReturn(Optional.empty());
 
         BadRequestException ex = assertThrows(BadRequestException.class, () ->
                 reservationService.bookReservation(clientId, lateTime, 2)
@@ -113,6 +142,7 @@ class ReservationServiceTest {
         Long clientId = 1L;
         LocalDateTime futureTime = LocalDate.now().plusDays(1).atTime(14, 0, 0);
 
+        when(holidayRepository.findByDate(futureTime.toLocalDate())).thenReturn(Optional.empty());
         when(clientRepository.findById(clientId))
                 .thenReturn(Optional.of(new Client(clientId, "Иван", "+79991112233", "ivan@mail.ru")));
         when(reservationRepository.hasActiveReservationOnDate(eq(clientId), any(LocalDate.class)))
@@ -131,6 +161,7 @@ class ReservationServiceTest {
         Long clientId = 1L;
         LocalDateTime futureTime = LocalDate.now().plusDays(1).atTime(10, 0, 0);
 
+        when(holidayRepository.findByDate(futureTime.toLocalDate())).thenReturn(Optional.empty());
         when(clientRepository.findById(clientId))
                 .thenReturn(Optional.of(new Client(clientId, "Иван", "+79991112233", "ivan@mail.ru")));
         when(reservationRepository.hasActiveReservationOnDate(eq(clientId), eq(futureTime.toLocalDate())))
